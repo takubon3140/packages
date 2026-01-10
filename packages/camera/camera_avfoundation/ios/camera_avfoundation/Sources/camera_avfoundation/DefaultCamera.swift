@@ -124,6 +124,26 @@ final class DefaultCamera: NSObject, Camera {
   private var focusMode = FCPPlatformFocusMode.auto
   private var flashMode: FCPPlatformFlashMode
 
+  // MARK: - Macro Mode Properties
+  private var isUsingUltraWideForMacro = false
+  private var originalWideCamera: CaptureDevice?
+  private var lastSwitchTimestamp: TimeInterval = 0
+  private var lensSamples: [Float] = []
+  private let maxLensSamples = 6
+  private var consecutiveBelowEnter = 0
+  private var consecutiveAboveExit = 0
+  private let enterThreshold: Float = 0.20  // Focus distance threshold for entering macro mode
+  private let staticExitThreshold: Float = 0.75  // Focus distance threshold for exiting macro mode
+  private var dynamicExitThreshold: Float = 0.75
+  private let switchCooldown: TimeInterval = 0.8  // Cooldown period between camera switches
+  private var lastSwitchLensPosition: Float = .nan
+  private var hasUltraWideCamera = false
+  private var correctionZoom: Float = 1.0
+  private var cameraChangeLock = false
+
+  /// Timer for lens position monitoring
+  private var lensPositionTimer: Timer?
+
   private static func flutterErrorFromNSError(_ error: NSError) -> FlutterError {
     return FlutterError(
       code: "Error \(error.code)",
@@ -231,6 +251,7 @@ final class DefaultCamera: NSObject, Camera {
     }
 
     updateOrientation()
+    setupMacroModeIfAvailable()
   }
 
   // Possible values for presets are hard-coded in FLT interface having
@@ -1416,7 +1437,211 @@ final class DefaultCamera: NSObject, Camera {
     }
   }
 
+  // MARK: - Macro Mode Implementation
+
+  /// Setup macro mode if ultra wide camera is available
+  private func setupMacroModeIfAvailable() {
+    // Check if ultra wide camera is available
+    let ultraWideCamera = findCameraWithType(.builtInUltraWideCamera, position: .back)
+    hasUltraWideCamera = ultraWideCamera != nil
+
+    if hasUltraWideCamera {
+      print("[MacroMode] Ultra wide camera available for macro mode")
+      setupZoomCorrection()
+      startMonitoringForMacroMode()
+    } else {
+      print("[MacroMode] Ultra wide camera not available")
+    }
+  }
+
+  /// Find camera device by type and position
+  private func findCameraWithType(_ deviceType: AVCaptureDevice.DeviceType, position: AVCaptureDevice.Position) -> CaptureDevice? {
+    let discoverySession = AVCaptureDevice.DiscoverySession(
+      deviceTypes: [deviceType],
+      mediaType: .video,
+      position: position
+    )
+    return discoverySession.devices.first
+  }
+
+  /// Calculate zoom correction factor between wide and ultra wide cameras
+  private func setupZoomCorrection() {
+    guard let wideCamera = findCameraWithType(.builtInWideAngleCamera, position: .back),
+          let ultraWideCamera = findCameraWithType(.builtInUltraWideCamera, position: .back) else {
+      return
+    }
+
+    let wideFOV = wideCamera.activeFormat.videoFieldOfView
+    let ultraWideFOV = ultraWideCamera.activeFormat.videoFieldOfView
+
+    // Calculate correction zoom factor
+    correctionZoom = Float(ultraWideFOV / wideFOV)
+    print("[MacroMode] Zoom correction factor: \(correctionZoom)")
+  }
+
+  /// Start monitoring lens position for macro mode switching
+  private func startMonitoringForMacroMode() {
+    guard hasUltraWideCamera else { return }
+
+    // Setup KVO for lens position
+    captureDevice.addObserver(self, forKeyPath: "lensPosition", options: [.new], context: nil)
+
+    // Start timer for periodic checks
+    lensPositionTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
+      self?.checkLensPosition()
+    }
+  }
+
+  /// Stop monitoring for macro mode
+  private func stopMonitoringForMacroMode() {
+    lensPositionTimer?.invalidate()
+    lensPositionTimer = nil
+    captureDevice.removeObserver(self, forKeyPath: "lensPosition")
+  }
+
+  /// Monitor lens position changes
+  override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
+    if keyPath == "lensPosition" {
+      checkLensPosition()
+    } else {
+      super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
+    }
+  }
+
+  /// Check current lens position and decide if camera switching is needed
+  private func checkLensPosition() {
+    let currentPosition = captureDevice.lensPosition
+
+    // Cooldown guard
+    let now = CACurrentMediaTime()
+    if now - lastSwitchTimestamp < switchCooldown {
+      return
+    }
+
+    // Dead band to prevent unnecessary switching
+    let minDelta: Float = 0.05
+    if abs(currentPosition - lastSwitchLensPosition) < minDelta && cameraChangeLock {
+      return
+    }
+
+    cameraChangeLock = false
+
+    // Add sample to moving average
+    lensSamples.append(currentPosition)
+    if lensSamples.count > maxLensSamples {
+      lensSamples.removeFirst()
+    }
+
+    // Calculate average position
+    let averagePosition = lensSamples.reduce(0, +) / Float(lensSamples.count)
+
+    // Decision logic for camera switching
+    if !isUsingUltraWideForMacro && averagePosition <= enterThreshold {
+      consecutiveBelowEnter += 1
+      if consecutiveBelowEnter >= 3 { // Require 3 consecutive samples below threshold
+        switchToUltraWideCameraForMacro()
+      }
+    } else if isUsingUltraWideForMacro && averagePosition >= dynamicExitThreshold {
+      consecutiveAboveExit += 1
+      if consecutiveAboveExit >= 3 { // Require 3 consecutive samples above threshold
+        switchBackToWideCameraFromMacro()
+      }
+    } else {
+      // Reset counters if not consistently in switching range
+      consecutiveBelowEnter = 0
+      consecutiveAboveExit = 0
+    }
+  }
+
+  /// Switch from wide camera to ultra wide camera for macro mode
+  private func switchToUltraWideCameraForMacro() {
+    guard let ultraWideCamera = findCameraWithType(.builtInUltraWideCamera, position: .back),
+          !isUsingUltraWideForMacro else {
+      return
+    }
+
+    print("[MacroMode] Switching to ultra wide camera for macro mode")
+
+    // Store original wide camera
+    if !isUsingUltraWideForMacro {
+      originalWideCamera = captureDevice
+    }
+
+    // Perform camera switch
+    switchCamera(to: ultraWideCamera, isUltraWideMode: true)
+  }
+
+  /// Switch back from ultra wide camera to wide camera
+  private func switchBackToWideCameraFromMacro() {
+    guard let originalCamera = originalWideCamera,
+          isUsingUltraWideForMacro else {
+      return
+    }
+
+    print("[MacroMode] Switching back to wide camera from macro mode")
+
+    // Switch back to original camera
+    switchCamera(to: originalCamera, isUltraWideMode: false)
+  }
+
+  /// Perform the actual camera switch
+  private func switchCamera(to newCamera: CaptureDevice, isUltraWideMode: Bool) {
+    videoCaptureSession.beginConfiguration()
+
+    // Remove current input
+    videoCaptureSession.removeInput(captureVideoInput)
+
+    do {
+      // Create new input with the new camera
+      let newInput = try captureDeviceInputFactory.deviceInput(with: newCamera)
+
+      if videoCaptureSession.canAddInput(newInput) {
+        videoCaptureSession.addInput(newInput)
+
+        // Update capture device and input
+        captureDevice = newCamera
+        captureVideoInput = newInput
+
+        // Apply zoom correction if switching to ultra wide
+        if isUltraWideMode {
+          try captureDevice.lockForConfiguration()
+          captureDevice.videoZoomFactor = CGFloat(correctionZoom)
+          captureDevice.unlockForConfiguration()
+        }
+
+        // Update state
+        isUsingUltraWideForMacro = isUltraWideMode
+        lastSwitchTimestamp = CACurrentMediaTime()
+        lastSwitchLensPosition = captureDevice.lensPosition
+        cameraChangeLock = true
+
+        // Reset counters
+        consecutiveBelowEnter = 0
+        consecutiveAboveExit = 0
+        lensSamples.removeAll()
+
+        // Update dynamic exit threshold
+        dynamicExitThreshold = isUltraWideMode ? staticExitThreshold : staticExitThreshold
+
+      } else {
+        print("[MacroMode] Failed to add new camera input")
+      }
+    } catch {
+      print("[MacroMode] Error switching camera: \(error)")
+    }
+
+    videoCaptureSession.commitConfiguration()
+  }
+
+  /// Cleanup macro mode resources
+  private func cleanupMacroMode() {
+    stopMonitoringForMacroMode()
+    originalWideCamera = nil
+    isUsingUltraWideForMacro = false
+  }
+
   deinit {
     motionManager.stopAccelerometerUpdates()
+    cleanupMacroMode()
   }
 }
