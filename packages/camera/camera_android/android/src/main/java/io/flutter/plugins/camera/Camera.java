@@ -16,6 +16,7 @@ import android.hardware.camera2.CameraDevice;
 import android.hardware.camera2.CameraManager;
 import android.hardware.camera2.CameraMetadata;
 import android.hardware.camera2.CaptureRequest;
+import android.hardware.camera2.CaptureResult;
 import android.hardware.camera2.TotalCaptureResult;
 import android.hardware.camera2.params.OutputConfiguration;
 import android.hardware.camera2.params.SessionConfiguration;
@@ -640,7 +641,12 @@ class Camera
 
     final AutoFocusFeature autoFocusFeature = cameraFeatures.getAutoFocus();
     final boolean isAutoFocusSupported = autoFocusFeature.checkIsSupported();
-    if (isAutoFocusSupported && autoFocusFeature.getValue() == FocusMode.auto) {
+    final Integer afState = cameraCaptureCallback.getLastAfState();
+    if (isAutoFocusSupported &&
+        autoFocusFeature.getValue() == FocusMode.auto &&
+        (afState == null ||
+        (afState != CaptureResult.CONTROL_AF_STATE_FOCUSED_LOCKED &&
+        afState != CaptureResult.CONTROL_AF_STATE_PASSIVE_FOCUSED))) {
       runPictureAutoFocus();
     } else {
       runPrecaptureSequence();

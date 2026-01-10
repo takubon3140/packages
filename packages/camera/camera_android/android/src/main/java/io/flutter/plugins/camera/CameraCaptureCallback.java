@@ -25,6 +25,7 @@ class CameraCaptureCallback extends CaptureCallback {
   private CameraState cameraState;
   private final CaptureTimeoutsWrapper captureTimeouts;
   private final CameraCaptureProperties captureProps;
+  private Integer lastAfState;
 
   // Lookup keys for state; overrideable for unit tests since Mockito can't mock them.
   @VisibleForTesting @NonNull
@@ -79,6 +80,11 @@ class CameraCaptureCallback extends CaptureCallback {
   private void process(CaptureResult result) {
     Integer aeState = result.get(aeStateKey);
     Integer afState = result.get(afStateKey);
+
+    // Store the last AF state for use in Camera.java
+    if (afState != null) {
+      this.lastAfState = afState;
+    }
 
     // Update capture properties
     if (result instanceof TotalCaptureResult) {
@@ -175,6 +181,15 @@ class CameraCaptureCallback extends CaptureCallback {
       @NonNull CaptureRequest request,
       @NonNull TotalCaptureResult result) {
     process(result);
+  }
+
+  /**
+   * Gets the last known AF state.
+   *
+   * @return the last known AF state, or null if not available.
+   */
+  public Integer getLastAfState() {
+    return lastAfState;
   }
 
   /** An interface that describes the different state changes implementers can be informed about. */
