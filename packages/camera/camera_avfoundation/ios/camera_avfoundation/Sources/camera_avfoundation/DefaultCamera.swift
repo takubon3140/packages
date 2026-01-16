@@ -1471,24 +1471,32 @@ final class DefaultCamera: NSObject, Camera {
       return
     }
 
-    let wideFOV = wideCamera.activeFormat.videoFieldOfView
-    let ultraWideFOV = ultraWideCamera.activeFormat.videoFieldOfView
+    let wideFOV = wideCamera.flutterActiveFormat.avFormat.videoFieldOfView * .pi / 180.0
+    let ultraWideFOV = ultraWideCamera.flutterActiveFormat.avFormat.videoFieldOfView * .pi / 180.0
 
     // Calculate correction zoom factor
-    correctionZoom = Float(ultraWideFOV / wideFOV)
+    correctionZoom = tan(ultraWideFOV / 2.0) / tan(wideFOV / 2.0)
     print("[MacroMode] Zoom correction factor: \(correctionZoom)")
   }
 
   /// Start monitoring lens position for macro mode switching
   private func startMonitoringForMacroMode() {
     guard hasUltraWideCamera else { return }
+      
+    DispatchQueue.main.async { [weak self] in
+      guard let self else { return }
 
-    // Setup KVO for lens position
-    captureDevice.addObserver(self, forKeyPath: "lensPosition", options: [.new], context: nil)
+      self.lensPositionTimer?.invalidate()
 
-    // Start timer for periodic checks
-    lensPositionTimer = Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in
-      self?.checkLensPosition()
+      let timer = Timer(timeInterval: 0.1, repeats: true) { [weak self] _ in
+        guard let self else { return }
+        self.captureSessionQueue.async { [weak self] in
+         self?.checkLensPosition()
+        }
+      }
+
+      RunLoop.main.add(timer, forMode: .common)
+      self.lensPositionTimer = timer
     }
   }
 
@@ -1496,21 +1504,11 @@ final class DefaultCamera: NSObject, Camera {
   private func stopMonitoringForMacroMode() {
     lensPositionTimer?.invalidate()
     lensPositionTimer = nil
-    captureDevice.removeObserver(self, forKeyPath: "lensPosition")
-  }
-
-  /// Monitor lens position changes
-  override func observeValue(forKeyPath keyPath: String?, of object: Any?, change: [NSKeyValueChangeKey : Any]?, context: UnsafeMutableRawPointer?) {
-    if keyPath == "lensPosition" {
-      checkLensPosition()
-    } else {
-      super.observeValue(forKeyPath: keyPath, of: object, change: change, context: context)
-    }
   }
 
   /// Check current lens position and decide if camera switching is needed
   private func checkLensPosition() {
-    let currentPosition = captureDevice.lensPosition
+    let currentPosition = captureDevice.avDevice.lensPosition
 
     // Cooldown guard
     let now = CACurrentMediaTime()
@@ -1587,51 +1585,81 @@ final class DefaultCamera: NSObject, Camera {
   /// Perform the actual camera switch
   private func switchCamera(to newCamera: CaptureDevice, isUltraWideMode: Bool) {
     videoCaptureSession.beginConfiguration()
+    defer { videoCaptureSession.commitConfiguration() }
 
-    // Remove current input
+    // 1) 旧 input / 旧 output を外す
     videoCaptureSession.removeInput(captureVideoInput)
+    videoCaptureSession.removeOutput(captureVideoOutput.avOutput)
+
+    // ★安全のため photo output も外す（古い接続残存を避ける）
+    videoCaptureSession.removeOutput(capturePhotoOutput.avOutput)
 
     do {
-      // Create new input with the new camera
-      let newInput = try captureDeviceInputFactory.deviceInput(with: newCamera)
+        // 2) 新しい camera で input/output/connection を作り直す
+        let (newInput, newOutput, newConn) = try DefaultCamera.createConnection(
+          captureDevice: newCamera,
+          videoFormat: videoFormat,
+          captureDeviceInputFactory: captureDeviceInputFactory
+        )
 
-      if videoCaptureSession.canAddInput(newInput) {
-        videoCaptureSession.addInput(newInput)
+        // 3) delegate を再設定
+        newOutput.setSampleBufferDelegate(self, queue: captureSessionQueue)
 
-        // Update capture device and input
-        captureDevice = newCamera
-        captureVideoInput = newInput
+        // 4) 新 input/output/connection を追加（NoConnections流儀で統一）
+        videoCaptureSession.addInputWithNoConnections(newInput)
+        videoCaptureSession.addOutputWithNoConnections(newOutput.avOutput)
+        videoCaptureSession.addConnection(newConn)
 
-        // Apply zoom correction if switching to ultra wide
-        if isUltraWideMode {
-          try captureDevice.lockForConfiguration()
-          captureDevice.videoZoomFactor = CGFloat(correctionZoom)
-          captureDevice.unlockForConfiguration()
+        // ★photo output も NoConnections で追加
+        videoCaptureSession.addOutputWithNoConnections(capturePhotoOutput.avOutput)
+
+        // ★photo connection を明示的に張る
+        let photoConn = AVCaptureConnection(inputPorts: newInput.ports, output: capturePhotoOutput.avOutput)
+        if videoCaptureSession.canAddConnection(photoConn) {
+          videoCaptureSession.addConnection(photoConn)
+        } else {
+          print("[MacroMode] Failed to add photo connection")
         }
 
-        // Update state
+        // 5) 参照を更新
+        captureDevice = newCamera
+        captureVideoInput = newInput
+        captureVideoOutput = newOutput
+
+        // 6) ここで向き適用（新しい connection に対して）
+        updateOrientation()
+
+        // 7) 切替後の AF/AE を再初期化
+        try? captureDevice.lockForConfiguration()
+        if captureDevice.isFocusModeSupported(.continuousAutoFocus) {
+          captureDevice.focusMode = .continuousAutoFocus
+        } else if captureDevice.isFocusModeSupported(.autoFocus) {
+          captureDevice.focusMode = .autoFocus
+        }
+        if captureDevice.isFocusPointOfInterestSupported {
+          captureDevice.focusPointOfInterest = CGPoint(x: 0.5, y: 0.5)
+        }
+        captureDevice.videoZoomFactor = 1.0
+        captureDevice.unlockForConfiguration()
+
+        applyFocusMode()
+        applyExposureMode()
+
+        // 状態更新
         isUsingUltraWideForMacro = isUltraWideMode
         lastSwitchTimestamp = CACurrentMediaTime()
-        lastSwitchLensPosition = captureDevice.lensPosition
+        lastSwitchLensPosition = captureDevice.avDevice.lensPosition
         cameraChangeLock = true
-
-        // Reset counters
         consecutiveBelowEnter = 0
         consecutiveAboveExit = 0
         lensSamples.removeAll()
+        dynamicExitThreshold = staticExitThreshold
 
-        // Update dynamic exit threshold
-        dynamicExitThreshold = isUltraWideMode ? staticExitThreshold : staticExitThreshold
-
-      } else {
-        print("[MacroMode] Failed to add new camera input")
-      }
     } catch {
       print("[MacroMode] Error switching camera: \(error)")
     }
-
-    videoCaptureSession.commitConfiguration()
   }
+
 
   /// Cleanup macro mode resources
   private func cleanupMacroMode() {
